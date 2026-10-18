@@ -1,0 +1,12 @@
+menu "Tab5 application"
+    config TAB5_LCD_PIXEL_CLOCK_MHZ
+        int "Original ILI9881C LCD pixel clock (MHz)"
+        range 30 60
+        default 60
+        help
+            Pixel clock for the original Tab5 ILI9881C 720 x 1280 panel.
+            60 MHz gives approximately 48 Hz scanout and is the tested native
+            rate. Trials at 40 and 50 MHz caused visible instability on the
+            original panel. Lower clocks require separate timing validation.
+            Other panel revisions keep their BSP timings.
+endmenu

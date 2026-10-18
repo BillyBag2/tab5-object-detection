@@ -15,3 +15,13 @@ function(tab5_optimize_sources directory)
         tab5_optimize_sources("${child}")
     endforeach()
 endfunction()
+
+function(tab5_audit_optimization)
+    if(TAB5_INFERENCE_AUDIT AND TAB5_AUDIT_DL_O2)
+        idf_component_get_property(dl_target espressif__esp-dl COMPONENT_LIB)
+        # SHELL keeps CMake option deduplication from dropping this final -O2
+        # because the IDF global flags already contain an earlier -O2.
+        target_compile_options(${dl_target} PRIVATE "SHELL:-O2")
+        message(STATUS "Inference audit: final -O2 override on ${dl_target}")
+    endif()
+endfunction()

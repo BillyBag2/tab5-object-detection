@@ -7,7 +7,7 @@ SD card is needed.
 - Live RGB565 camera preview, rotated to match the Tab5 camera mounting.
 - COCO-trained **YOLO11 nano INT8, 320×320 input**, with all 80 classes.
 - Up to 10 bounding boxes with class names and confidence percentages.
-- Separate capture/preview and detection tasks. Camera delivery and preview target 5 fps;
+- Separate capture/preview and detection tasks. The sensor and preview target 1 fps;
   inference takes the next available frame without accumulating a backlog.
 - P4 PPA hardware scales and rotates frames while the capture task waits for
   DMA completion, giving CPU 0 time to run its idle task and service the watchdog.
@@ -86,18 +86,22 @@ Existing generated `sdkconfig` files must also select this custom profile and
 enable `CONFIG_ESP_IPA_ACC_ALGORITHM`; defaults do not override saved settings.
 The task watchdog remains enabled.
 
-Detection runs at idle priority on CPU 1 so FreeRTOS time slicing lets IDLE1
-service the watchdog during model loading and inference, including the first
-run. Serial logs mark model loading and each completed inference with its object count.
+Detection runs at priority 1 on CPU 1; LVGL and capture use CPU 0. Frozen-input
+tests found changing raw network outputs with the previous idle-priority /
+unpinned-GUI scheduling. The new scheduling passed 48 repeatability checks
+across both 128 KiB and 256 KiB cache configurations, recorded in
+[INFERENCE_DIAGNOSTICS.md](INFERENCE_DIAGNOSTICS.md). The watchdog stays enabled:
+the detector yields after model loading and blocks between frame submissions.
+Serial logs mark model loading and each completed inference with its object count.
 `PROFILE` lines separately measure preview PPA, inference PPA, scheduling wait,
 preprocessing, neural network execution, postprocessing and total elapsed time.
 The first run is marked cold. Save serial output and run
 `python tests/summarize_profile.py capture.log` for warm-run statistics.
 See [PIPELINE.md](PIPELINE.md) for stage definitions and the updated diagram. Camera
-capture and display tasks retain higher priority; detection latency includes
-time spent sharing the CPU.
+capture and display tasks run on the other core; detection latency still
+includes any preemption by system tasks.
 
-The confidence score threshold is 0.25 and NMS threshold is 0.5 in `main/main.cpp`.
+The confidence score threshold is 0.25 and NMS threshold is 0.5 in `main/profiled_detector.hpp`.
 Lowering the confidence threshold admits weaker detections, increasing both
 sensitivity and the chance of false positives.
 Espressif's published ESP32-P4 benchmark for the 320-input model is roughly
@@ -116,7 +120,27 @@ with one object. Current and historical timing results are in
 [PIPELINE.md](PIPELINE.md). Visual overlay alignment and detection
 accuracy still require testing with recognizable objects in the cropped preview.
 
-The camera requests 5 fps delivery through V4L2 frame skipping. The SC202CS
-physical sensor mode remains 30 fps. Two additional 320-square RGB565 still
-buffers cost 400 KiB total; each changes only at an inference handoff, rather
-than being recopied every preview frame.
+The SC202CS now uses a custom **physical 1 fps sensor mode**. It retains the
+1280 x 720 RAW8 geometry, PLL, MIPI bitrate and line timing, but extends vertical
+frame length (VTS) from 1250 to 37500 lines. Driver format metadata is updated
+and the VTS registers are read back before streaming. Every sensor frame is
+then delivered: this does not rely on dropping 29 frames after DMA.
+`Camera::kTargetFps` and the custom-mode implementation are in `main/camera.*`.
+The low-fps capture timeout is 3 seconds. Serial cadence logs independently
+measure groups of five frame intervals.
+
+Two additional 320-square RGB565 still buffers cost 400 KiB total; each changes
+only at an inference handoff, rather than being recopied every preview frame.
+
+The original ILI9881C LCD retains its native **60 MHz pixel clock**, approximately
+48 Hz full-frame scanout. Trials at 40 and 50 MHz both caused visible instability
+and were reverted. LVGL still renders only dirty regions. The clock setting is
+under `Tab5 application` in `idf.py -B build/tab5 menuconfig`; the saved default
+is 60 MHz. Other Tab5 panel revisions keep their native timings. The application
+uses a DPI configuration wrapper without editing managed components.
+
+The saved cache configuration is **256 KiB L2 with 128-byte lines**. All five
+application image buffers are aligned to the runtime cache requirement. PSRAM
+remains cacheable; CSI, PPA and LCD drivers perform DMA synchronization. Cache
+ownership and measured trial results are documented in
+[PIPELINE.md](PIPELINE.md#cache-and-dma-ownership).

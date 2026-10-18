@@ -8,3 +8,4 @@ include(cmake/optimization.cmake)
 # Run after component configuration, including deferred ESP-DL setup, so
 # component-specific -Os/-O2 settings cannot silently override the project policy.
 cmake_language(DEFER CALL tab5_optimize_sources "${CMAKE_CURRENT_SOURCE_DIR}")
+cmake_language(DEFER CALL tab5_audit_optimization)

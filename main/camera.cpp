@@ -9,6 +9,8 @@
 #include "bsp/esp-bsp.h"
 #include "esp_video_device.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_video_ioctl.h"
 
 namespace {
 constexpr char TAG[] = "camera";
@@ -19,12 +21,77 @@ esp_err_t failure(const char *operation)
 }
 }
 
+esp_err_t Camera::configure_sensor_rate()
+{
+    esp_cam_sensor_format_t original = {};
+    if (ioctl(fd_, VIDIOC_G_SENSOR_FMT, &original)) return failure("get sensor format");
+    if (original.width != 1280 || original.height != 720 || original.fps != 30 ||
+        original.format != ESP_CAM_SENSOR_PIXFORMAT_RAW8 || !original.isp_info ||
+        original.isp_info->isp_v1_info.vts != 1250 || original.regs_size <= 0) {
+        ESP_LOGE(TAG, "1 fps timing requires the pinned SC202CS 1280 x 720 RAW8 30 fps base mode");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // Keep PLL, MIPI bitrate, HTS and line/exposure timing unchanged. Extend
+    // vertical blanking 30-fold: VTS 1250 -> 37500 lines, one frame per second.
+    // Keep the custom format and register storage alive for the sensor driver.
+    sensor_format_ = original;
+    sensor_isp_info_ = std::make_unique<esp_cam_sensor_isp_info_t>(*original.isp_info);
+    const uint32_t vts = original.isp_info->isp_v1_info.vts * original.fps / kTargetFps;
+    if (vts > UINT16_MAX) return ESP_ERR_INVALID_SIZE;
+    const auto *regs = static_cast<const sc202cs_reginfo_t *>(original.regs);
+    int count = 0;
+    while (count < original.regs_size && regs[count].reg != 0xffff) ++count;
+    if (count == original.regs_size) return ESP_ERR_INVALID_RESPONSE;
+    sensor_registers_.assign(regs, regs + count);
+    sensor_registers_.push_back({0x320e, uint8_t(vts >> 8)});
+    sensor_registers_.push_back({0x320f, uint8_t(vts)});
+    sensor_registers_.push_back({0xffff, 0});
+    sensor_isp_info_->isp_v1_info.vts = vts;
+    sensor_format_.name = "TAB5_SC202CS_1280X720_RAW8_1FPS";
+    sensor_format_.fps = kTargetFps;
+    sensor_format_.regs = sensor_registers_.data();
+    sensor_format_.regs_size = sensor_registers_.size();
+    sensor_format_.isp_info = sensor_isp_info_.get();
+    if (ioctl(fd_, VIDIOC_S_SENSOR_FMT, &sensor_format_)) return failure("set 1 fps sensor timing");
+
+    // Verify that the frame-length bits actually took effect before streaming.
+    uint32_t actual_vts = 0;
+    for (uint32_t reg : {0x320e, 0x320f}) {
+        esp_cam_sensor_reg_val_t value = {reg, 0};
+        v4l2_ext_control control = {};
+        control.id = ESP_CAM_SENSOR_IOC_G_REG;
+        control.size = sizeof(value);
+        control.p_u8 = reinterpret_cast<uint8_t *>(&value);
+        v4l2_ext_controls controls = {};
+        controls.ctrl_class = V4L2_CTRL_CLASS_ESP_CAM_IOCTL;
+        controls.count = 1;
+        controls.controls = &control;
+        if (ioctl(fd_, VIDIOC_S_EXT_CTRLS, &controls)) return failure("read back sensor VTS");
+        actual_vts = (actual_vts << 8) | (value.value & 0xff);
+    }
+    if (actual_vts != vts) {
+        ESP_LOGE(TAG, "Sensor VTS readback %lu does not match requested %lu",
+                 (unsigned long)actual_vts, (unsigned long)vts);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ESP_LOGI(TAG, "Sensor configured at %lu fps: VTS=%lu, HTS=%d, line=%lu ns; MIPI bitrate unchanged",
+             (unsigned long)kTargetFps, (unsigned long)vts, sensor_isp_info_->isp_v1_info.hts,
+             (unsigned long)sensor_isp_info_->isp_v1_info.tline_ns);
+    return ESP_OK;
+}
+
 esp_err_t Camera::start()
 {
     esp_err_t err = bsp_camera_start(nullptr);
     if (err != ESP_OK) return err;
     fd_ = open(BSP_CAMERA_DEVICE, O_RDONLY);
     if (fd_ < 0) return failure("open CSI device");
+    err = configure_sensor_rate();
+    if (err != ESP_OK) return err;
+    timeval timeout = {};
+    timeout.tv_sec = 3;
+    if (ioctl(fd_, VIDIOC_S_DQBUF_TIMEOUT, &timeout)) return failure("set low-fps capture timeout");
 
     v4l2_format fmt = {};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -53,21 +120,21 @@ esp_err_t Camera::start()
     stride = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width * 2;
     if (!width || !height || stride < width * 2) return ESP_ERR_INVALID_SIZE;
 
-    // esp_video implements TIMEPERFRAME by skipping frames, not by changing
-    // the SC202CS sensor timing. Deliver 5 fps to this application.
+    // The sensor now runs at 1 fps. Request the same delivery rate, so the
+    // driver's skip factor is 1: every physical frame reaches the application.
     v4l2_streamparm rate = {};
     rate.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     rate.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
     rate.parm.capture.timeperframe.numerator = 1;
-    rate.parm.capture.timeperframe.denominator = 5;
+    rate.parm.capture.timeperframe.denominator = kTargetFps;
     if (ioctl(fd_, VIDIOC_S_PARM, &rate)) {
-        ESP_LOGW(TAG, "5 fps delivery request unsupported (errno %d); application still caps preview at 5 fps", errno);
+        return failure("disable camera frame skipping");
     } else {
         delivery_rate_limited = true;
         rate = {};
         rate.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(fd_, VIDIOC_G_PARM, &rate) == 0) {
-            ESP_LOGI(TAG, "Camera delivery rate: %lu/%lu fps (driver frame skipping; sensor mode unchanged)",
+            ESP_LOGI(TAG, "Camera delivery rate: %lu/%lu fps (sensor rate; no frame skipping)",
                      (unsigned long)rate.parm.capture.timeperframe.denominator,
                      (unsigned long)rate.parm.capture.timeperframe.numerator);
         }
@@ -115,6 +182,15 @@ esp_err_t Camera::acquire(const uint8_t *&pixels)
         return ESP_ERR_INVALID_SIZE;
     }
     pixels = static_cast<const uint8_t *>(buffers_[buf.index]);
+    const int64_t now = esp_timer_get_time();
+    if (!cadence_start_us_) {
+        cadence_start_us_ = now;
+    } else if (++cadence_frames_ == 5) {
+        ESP_LOGI(TAG, "Sensor cadence: %.3f fps across 5 frame intervals (no driver skipping)",
+                 5000000.0 / (now - cadence_start_us_));
+        cadence_start_us_ = now;
+        cadence_frames_ = 0;
+    }
     return ESP_OK;
 }
 

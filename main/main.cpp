@@ -10,10 +10,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include "driver/ppa.h"
 #include "esp_private/esp_cache_private.h"
 #include "camera.hpp"
 #include "coco_labels.hpp"
+#include "inference_audit.hpp"
 
 namespace {
 constexpr char TAG[] = "tab5_detect";
@@ -21,7 +23,7 @@ constexpr int kMaxBoxes = 10;
 constexpr int kModelSize = 320;
 constexpr int kInferenceCropSize = kModelSize * 2;
 constexpr size_t kInferenceBytes = kModelSize * kModelSize * sizeof(uint16_t);
-constexpr int64_t kPreviewPeriodUs = 1000000 / 5;
+constexpr int64_t kPreviewPeriodUs = 1000000 / Camera::kTargetFps;
 
 struct Box {
     int x1, y1, x2, y2, category;
@@ -171,6 +173,10 @@ void create_preview()
 // PPA handles the strided reads required for rotation without monopolizing the
 // CPU on PSRAM cache misses. Blocking mode sleeps until DMA completes, keeping
 // the source camera buffer owned until the accelerator has finished reading it.
+// IDF's SRM driver writes back the source and invalidates the aligned output
+// before DMA. Nobody reads/writes the output until the blocking call returns.
+// Keep cached PSRAM and let the driver own synchronization; do not flush stale
+// CPU data over a completed DMA result or use an uncached alias here.
 esp_err_t prepare_frame(const uint8_t *source, uint16_t *destination)
 {
     ppa_srm_oper_config_t operation = {};
@@ -265,7 +271,14 @@ void detect_task(void *)
     // Eager load once; model allocation never runs while holding the LVGL lock.
     ESP_LOGI(TAG, "Loading YOLO11n 320 model");
     ProfiledCocoDetector detector;
+    ESP_LOGI(TAG, "After model load: internal free=%u largest=%u; PSRAM free=%u",
+             unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     ESP_LOGI(TAG, "Model loaded; waiting for camera frame");
+    // Service IDLE1 between model loading and the first inference. Keep the
+    // watchdog enabled without time-slicing every network with the idle task.
+    vTaskDelay(pdMS_TO_TICKS(10));
     unsigned sequence = 0;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -274,6 +287,13 @@ void detect_task(void *)
         image.width = kModelSize;
         image.height = kModelSize;
         image.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
+#if TAB5_INFERENCE_AUDIT
+        if (!sequence) {
+            // Capture holds the inference semaphore for this entire test. The
+            // camera keeps streaming to its other buffers; this frame is frozen.
+            inference_audit::run(detector, image, CONFIG_CACHE_L2_CACHE_LINE_SIZE, kInferenceBytes);
+        }
+#endif
         const int64_t start = esp_timer_get_time();
         auto &detections = detector.run(image);
         Results results;
@@ -324,7 +344,7 @@ void capture_task(void *)
             return;
         }
         const int64_t now = esp_timer_get_time();
-        // Process every delivered 5 fps frame. Applying another exact 200 ms
+        // Process every rate-limited frame. Applying another exact period
         // gate to that stream would drop frames due to small arrival jitter.
         if (camera.delivery_rate_limited || now - last_preview >= kPreviewPeriodUs) {
             const bool submit = xSemaphoreTake(inference_free, 0) == pdTRUE;
@@ -384,7 +404,19 @@ void capture_task(void *)
 
 extern "C" void app_main()
 {
-    if (!bsp_display_start()) {
+    // Preserve BSP display defaults, but keep GUI rendering off the inference
+    // core. Frozen-input diagnostics exposed preemption-sensitive raw outputs.
+    bsp_display_cfg_t display_config = {};
+    display_config.lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    display_config.lvgl_port_cfg.task_affinity = 0;
+    display_config.buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT;
+#if CONFIG_BSP_LCD_DRAW_BUF_DOUBLE
+    display_config.double_buffer = true;
+#endif
+    display_config.flags.buff_dma = true;
+    display_config.flags.buff_spiram = false;
+    display_config.flags.sw_rotate = true;
+    if (!bsp_display_start_with_config(&display_config)) {
         ESP_LOGE(TAG, "Display initialization failed");
         return;
     }
@@ -409,13 +441,17 @@ extern "C" void app_main()
         return;
     }
     preview_buffer_size = (image_bytes + alignment - 1) & ~(alignment - 1);
-    preview_pixels = static_cast<uint16_t *>(heap_caps_aligned_calloc(alignment, 1, preview_buffer_size,
-                                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    canvas_pixels = static_cast<uint16_t *>(heap_caps_calloc(1, image_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    inference_pixels = static_cast<uint16_t *>(heap_caps_aligned_calloc(alignment, 1, preview_buffer_size,
-                                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    analysing_pixels = static_cast<uint16_t *>(heap_caps_calloc(1, image_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    previous_pixels = static_cast<uint16_t *>(heap_caps_calloc(1, image_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ESP_LOGI(TAG, "Cache: L2=%u KiB, line=%u bytes; image buffer alignment=%u bytes, allocation=%u",
+             unsigned(CONFIG_CACHE_L2_CACHE_SIZE / 1024), unsigned(CONFIG_CACHE_L2_CACHE_LINE_SIZE),
+             unsigned(alignment), unsigned(preview_buffer_size));
+    preview_pixels = inference_audit::allocate(alignment, preview_buffer_size);
+    canvas_pixels = inference_audit::allocate(alignment, preview_buffer_size);
+    inference_pixels = inference_audit::allocate(alignment, preview_buffer_size);
+    // These three canvases are CPU-owned. Align them too, keeping adjacent
+    // allocations out of the same cache line; DMA synchronization stays with
+    // the CSI/PPA/LCD drivers that own each hardware transfer.
+    analysing_pixels = inference_audit::allocate(alignment, preview_buffer_size);
+    previous_pixels = inference_audit::allocate(alignment, preview_buffer_size);
     result_queue = xQueueCreate(1, sizeof(Results));
     inference_free = xSemaphoreCreateBinary();
     if (!preview_pixels || !canvas_pixels || !inference_pixels || !analysing_pixels || !previous_pixels || !result_queue || !inference_free) {
@@ -431,10 +467,10 @@ extern "C" void app_main()
     }
     create_preview();
     xSemaphoreGive(inference_free);
-    // ESP-DL loading/inference can compute for longer than the watchdog period
-    // without blocking. Time-slice with IDLE1 even inside those calls; a delay
-    // after detector.run() alone cannot protect against a long first inference.
-    if (xTaskCreatePinnedToCore(detect_task, "coco_detect", 16384, nullptr, tskIDLE_PRIORITY, &detector_task, 1) != pdPASS) {
+    // Use normal priority on core 1. The optimized network is bounded below
+    // the watchdog period and blocks for a new frame after each result.
+    // Scheduler suspension is confined to the optional diagnostic test.
+    if (xTaskCreatePinnedToCore(detect_task, "coco_detect", 16384, nullptr, 1, &detector_task, 1) != pdPASS) {
         show_error("Detector task creation failed", ESP_ERR_NO_MEM);
         return;
     }
