@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=6.0,<6.2"
+  espressif/m5stack_tab5: "1.3.2"
+  espressif/coco_detect: "0.4.1"
+  lvgl/lvgl: ">=9.2,<10"
