@@ -28,12 +28,12 @@ esp_err_t Camera::configure_sensor_rate()
     if (original.width != 1280 || original.height != 720 || original.fps != 30 ||
         original.format != ESP_CAM_SENSOR_PIXFORMAT_RAW8 || !original.isp_info ||
         original.isp_info->isp_v1_info.vts != 1250 || original.regs_size <= 0) {
-        ESP_LOGE(TAG, "1 fps timing requires the pinned SC202CS 1280 x 720 RAW8 30 fps base mode");
+        ESP_LOGE(TAG, "Custom timing requires the pinned SC202CS 1280 x 720 RAW8 30 fps base mode");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     // Keep PLL, MIPI bitrate, HTS and line/exposure timing unchanged. Extend
-    // vertical blanking 30-fold: VTS 1250 -> 37500 lines, one frame per second.
+    // vertical blanking six-fold: VTS 1250 -> 7500 lines, five frames per second.
     // Keep the custom format and register storage alive for the sensor driver.
     sensor_format_ = original;
     sensor_isp_info_ = std::make_unique<esp_cam_sensor_isp_info_t>(*original.isp_info);
@@ -48,12 +48,12 @@ esp_err_t Camera::configure_sensor_rate()
     sensor_registers_.push_back({0x320f, uint8_t(vts)});
     sensor_registers_.push_back({0xffff, 0});
     sensor_isp_info_->isp_v1_info.vts = vts;
-    sensor_format_.name = "TAB5_SC202CS_1280X720_RAW8_1FPS";
+    sensor_format_.name = "TAB5_SC202CS_1280X720_RAW8_5FPS";
     sensor_format_.fps = kTargetFps;
     sensor_format_.regs = sensor_registers_.data();
     sensor_format_.regs_size = sensor_registers_.size();
     sensor_format_.isp_info = sensor_isp_info_.get();
-    if (ioctl(fd_, VIDIOC_S_SENSOR_FMT, &sensor_format_)) return failure("set 1 fps sensor timing");
+    if (ioctl(fd_, VIDIOC_S_SENSOR_FMT, &sensor_format_)) return failure("set custom sensor timing");
 
     // Verify that the frame-length bits actually took effect before streaming.
     uint32_t actual_vts = 0;
@@ -120,7 +120,7 @@ esp_err_t Camera::start()
     stride = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width * 2;
     if (!width || !height || stride < width * 2) return ESP_ERR_INVALID_SIZE;
 
-    // The sensor now runs at 1 fps. Request the same delivery rate, so the
+    // Request the sensor's physical rate, so the
     // driver's skip factor is 1: every physical frame reaches the application.
     v4l2_streamparm rate = {};
     rate.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;

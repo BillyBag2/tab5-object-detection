@@ -12,7 +12,7 @@
 // or inference after release(): the CSI DMA engine will overwrite it.
 class Camera {
 public:
-    static constexpr uint32_t kTargetFps = 1;
+    static constexpr uint32_t kTargetFps = 5;
     esp_err_t start();
     esp_err_t acquire(const uint8_t *&pixels);
     esp_err_t release();

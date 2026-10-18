@@ -1,5 +1,10 @@
 # Inference repeatability investigation, 2026-10-18
 
+Subsequent sensor-rate trial: the app now targets physical capture/preview at
+5 fps. Another 24 checks passed at that rate, and the deterministic raw outputs
+matched the corrected 1 fps build. See [the 5 fps trial](PIPELINE.md#physical-5-fps-sensor-trial)
+for current live timing; the 1 fps measurements below remain historical records.
+
 The reported improvement in person detection after increasing cache prompted a
 correctness investigation. A faster cache should not change the network's
 predictions for identical input. The tests reproduced changing **raw network

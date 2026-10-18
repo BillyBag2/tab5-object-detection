@@ -7,7 +7,7 @@ SD card is needed.
 - Live RGB565 camera preview, rotated to match the Tab5 camera mounting.
 - COCO-trained **YOLO11 nano INT8, 320×320 input**, with all 80 classes.
 - Up to 10 bounding boxes with class names and confidence percentages.
-- Separate capture/preview and detection tasks. The sensor and preview target 1 fps;
+- Separate capture/preview and detection tasks. The sensor and preview target 5 fps;
   inference takes the next available frame without accumulating a backlog.
 - P4 PPA hardware scales and rotates frames while the capture task waits for
   DMA completion, giving CPU 0 time to run its idle task and service the watchdog.
@@ -120,11 +120,11 @@ with one object. Current and historical timing results are in
 [PIPELINE.md](PIPELINE.md). Visual overlay alignment and detection
 accuracy still require testing with recognizable objects in the cropped preview.
 
-The SC202CS now uses a custom **physical 1 fps sensor mode**. It retains the
+The SC202CS now uses a custom **physical 5 fps sensor mode**. It retains the
 1280 x 720 RAW8 geometry, PLL, MIPI bitrate and line timing, but extends vertical
-frame length (VTS) from 1250 to 37500 lines. Driver format metadata is updated
+frame length (VTS) from 1250 to 7500 lines. Driver format metadata is updated
 and the VTS registers are read back before streaming. Every sensor frame is
-then delivered: this does not rely on dropping 29 frames after DMA.
+then delivered: this does not rely on post-DMA frame skipping.
 `Camera::kTargetFps` and the custom-mode implementation are in `main/camera.*`.
 The low-fps capture timeout is 3 seconds. Serial cadence logs independently
 measure groups of five frame intervals.

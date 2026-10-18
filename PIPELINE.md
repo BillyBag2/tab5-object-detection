@@ -13,11 +13,11 @@ application. Arrows show image or result flow, not physical wiring.
 
 ```mermaid
 flowchart TD
-    sensor["SC202CS camera sensor<br/>Hardware: sensor<br/>1280 x 720 RAW8 Bayer, 16:9<br/>Custom sensor rate: 1 fps; VTS 37500"]
+    sensor["SC202CS camera sensor<br/>Hardware: sensor<br/>1280 x 720 RAW8 Bayer, 16:9<br/>Custom sensor rate: 5 fps; VTS 7500"]
     csi["MIPI-CSI receiver<br/>Hardware: ESP32-P4 CSI, 1 data lane<br/>1280 x 720 RAW8"]
     isp["Image signal processing<br/>Hardware: P4 ISP; CPU IPA control task<br/>Demosaic, exposure / white balance control<br/>Output: 1280 x 720 RGB565"]
     capture["Capture buffers in PSRAM<br/>3 V4L2 MMAP buffers<br/>Each: 1280 x 720 RGB565<br/>Stride: 2560 bytes"]
-    select["Capture / preview task<br/>CPU 0: acquire buffer and select preview frames<br/>V4L2 delivery: 1 fps; no frame skipping"]
+    select["Capture / preview task<br/>CPU 0: acquire buffer and select preview frames<br/>V4L2 delivery: 5 fps; no frame skipping"]
     ppa["Shared crop, scale and rotate<br/>Hardware: PPA SRM + DMA2D<br/>Centre crop (320,40), 640 x 640; scale 0.5<br/>Rotate 90 degrees clockwise; output 320 x 320 RGB565"]
     preview["Two aligned PPA output buffers in PSRAM<br/>Each: 320 x 320 RGB565; 204800 bytes<br/>Detector idle: write directly into inference buffer<br/>Detector busy: write into preview staging buffer"]
 
@@ -45,7 +45,7 @@ flowchart TD
         canvas --> overlays --> render --> fb --> dsi --> panel
     end
 
-    preview -->|"Every physical sensor frame: 1 fps"| canvas
+    preview -->|"Every physical sensor frame: 5 fps"| canvas
     snapshot -->|"CPU 0: copy once per new inference, under LVGL lock"| analysing
     analysing["Analysing still canvas in PSRAM<br/>320 x 320 RGB565; fixed for this inference"]
     previous["Previous result canvas in PSRAM<br/>Copy analysing still on completion before replacing it<br/>320 x 320 RGB565; overlays from matching result"]
@@ -74,9 +74,9 @@ flowchart TD
 ```
 
 - **Physical capture rate:** a custom SC202CS mode extends vertical blanking
-  to VTS 37500 (from 1250), retaining the original PLL, MIPI bitrate, HTS and
+  to VTS 7500 (from 1250), retaining the original PLL, MIPI bitrate, HTS and
   per-line exposure timing. Both sensor format metadata and V4L2 delivery are
-  1 fps; the delivery skip factor is 1. The sensor registers are read back and
+  5 fps; the delivery skip factor is 1. The sensor registers are read back and
   serial cadence logs measure five frame intervals independently of inference.
   A 3-second dequeue timeout accommodates the slower physical stream.
 - **Results can lag the preview:** the screen keeps showing the live preview
@@ -219,7 +219,7 @@ A result with no detections clears boxes in both views.
 No square is highlighted during the first inference. Afterwards, exactly one
 square is highlighted, advancing at 0%, 25%, 50%, 75% and 100% of the previous
 measured inference duration. A 100 ms LVGL timer updates the guide independently
-of the 1 fps preview. The last square stays highlighted if the current run takes
+of the 5 fps preview. The last square stays highlighted if the current run takes
 longer; the next submitted sample resets it. It is an estimate, not measured
 model-layer progress, and does not delay inference or capture.
 
@@ -230,6 +230,9 @@ inference returned an object, exercising the overlay update path. These are
 short runtime checks, not visual validation of the panel or an accuracy test.
 
 ## Physical 1 fps sensor mode
+
+This records the earlier 1 fps trial. The current sensor rate is 5 fps;
+see [the physical 5 fps trial](#physical-5-fps-sensor-trial).
 
 `Camera::configure_sensor_rate()` clones the pinned SC202CS 1280 x 720 RAW8
 30 fps register table, appends VTS registers 0x320e/0x320f = 0x92/0x7c, and
@@ -242,7 +245,7 @@ The driver is instructed to deliver every frame rather than skip frames. Thus
 1280 x 720 RGB565 capture payload drops from approximately 55.3 MB/s at 30 fps
 to 1.84 MB/s at 1 fps, subject to the measured physical cadence. The instantaneous
 MIPI bitrate does not change. The sensor change alone does not affect LCD
-scanout; the separate lower LCD clock setting below reduces that traffic. The
+scanout; the lower LCD clock trials below were reverted after instability. The
 preceding 5 fps runtime results document the earlier post-DMA skipping mode.
 
 On-device validation on 2026-10-18: the custom VTS value read back correctly,
@@ -273,7 +276,7 @@ The display remains in continuous DSI video mode: every physical refresh scans
 the entire framebuffer, including unchanged pixels. LVGL uses partial rendering
 and copies only dirty regions into that framebuffer. Its 33 ms refresh period
 is not the physical panel refresh rate. The camera and live image remain at
-1 fps and the five-square guide keeps its 100 ms timer.
+1 fps during these trials and the five-square guide used its 100 ms timer.
 
 `main/display_clock.cpp` intercepts the public DPI panel creation call using a
 linker wrapper, copies the BSP configuration and changes only the pixel clock.
@@ -361,12 +364,51 @@ at both cache sizes and at ESP-DL `-O2`; suspending task switching removed it.
 The current app runs the detector at priority 1 on CPU 1 and pins LVGL to CPU 0.
 It passed 48 repeated-run integrity checks across 128 KiB and 256 KiB caches,
 including agreement with the suspended-switch controls. Normal firmware keeps
-256 KiB / 128-byte cache, `-O3`, physical capture 1 fps, LCD 60 MHz and watchdogs
+256 KiB / 128-byte cache, `-O3`, LCD 60 MHz and watchdogs
 enabled; diagnostic scheduler suspension is compiled out.
 
-The final 35 warm live profiles average **677.563 ms network**, approximately
+The 1 fps validation's 35 warm live profiles average **677.563 ms network**, approximately
 **696 ms detector** and **719.517 ms dequeue-to-result**. Capture remains near
-1 fps, allowing detection on every incoming frame. The exact underlying
+1 fps in that validation run, allowing detection on every incoming frame. The exact underlying
 kernel/RTOS-state cause remains unconfirmed; this is a tested scheduling
 mitigation. Full evidence, limitations and reproduction instructions are in
 [INFERENCE_DIAGNOSTICS.md](INFERENCE_DIAGNOSTICS.md).
+
+## Physical 5 fps sensor trial
+
+The current target is actual sensor readout and preview at **5 fps**, set by
+`Camera::kTargetFps`. The custom SC202CS format extends the native 30 fps
+frame length six-fold: VTS 1250 -> 7500 (`0x320e/0x320f = 0x1d/0x4c`).
+Sensor format metadata and V4L2 delivery both request 5 fps, with no driver
+skipping. Resolution stays 1280 x 720, RGB565 capture stride 2560 bytes,
+and the 640-square PPA crop still produces 320-square inference/preview images.
+
+Capture payload is approximately **9.22 MB/s**, versus 1.84 MB/s in the previous
+1 fps mode and 55.3 MB/s at native 30 fps. MIPI bitrate and per-line exposure
+timing stay unchanged; only frame blanking changes. The 256 KiB / 128-byte
+cache, aligned buffers, LVGL core 0, inference core 1 / priority 1, and native
+60 MHz LCD timing are retained.
+
+Five fps applies to capture and preview. Inference samples the latest available
+frame whenever the detector is free, without accumulating a frame backlog.
+Its throughput is limited by measured model latency, not set to five runs/sec.
+
+The 5 fps diagnostic build passed all **24 repeatability/integrity checks**
+under the increased camera workload. The deterministic pattern's raw output
+CRC remained `33c860ab`, matching the corrected 1 fps build; input/output
+stability, heap metadata and image guards all passed. This checks repeatability,
+not detection accuracy against a labelled dataset.
+
+Local artifacts: `build/tab5/sensor_five_fps_audit_build.log`,
+`sensor_five_fps_audit_flash.log`, `sensor_five_fps_audit_runtime.log`,
+`sensor_five_fps_build.log`, `sensor_five_fps_flash.log` and
+`sensor_five_fps_runtime.log` in the same directory.
+
+The normal 5 fps build was flashed and hash-verified with diagnostics disabled.
+A 40-second serial capture completed 35 warm profiles without captured errors,
+crashes or watchdog resets. Across 37 cadence windows, capture averaged
+**5.003 fps** including initial settling. Warm means were **850.508 ms network**,
+approximately **870 ms full detector**, and **896.142 ms dequeue-to-result**.
+Samples were submitted about once per second while preview continued at 5 fps.
+The corresponding 1 fps capture run averaged about 696 ms full detector time;
+this trial provides smoother preview with a higher inference latency.
